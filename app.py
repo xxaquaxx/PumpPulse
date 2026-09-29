@@ -224,7 +224,10 @@ async function tg(){await fetch(paused?"/api/resume":"/api/pause",{method:"POST"
 async function cls(m){await fetch("/api/close/"+m,{method:"POST",headers:H});load()}
 load();setInterval(load,5000)
 </script></body></html>"""
-
 @app.get("/", response_class=HTMLResponse)
 def index():
+    return HTMLResponse('<meta http-equiv="refresh" content="0;url=/terminal">')
+
+@app.get("/old", response_class=HTMLResponse)
+def old():
     return PAGE
