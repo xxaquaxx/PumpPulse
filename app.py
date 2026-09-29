@@ -25,39 +25,65 @@ def save():
     json.dump(state, open(STATE_FILE, "w"))
 
 def load():
-    if os.path.exists(STATE_FILE):
-        state.update(json.load(open(STATE_FILE)))
+    try:
+        if os.path.exists(STATE_FILE):
+            state.update(json.load(open(STATE_FILE)))
+    except Exception:
+        pass
 
 def day_pnl():
     start = time.time() - (time.time() % 86400)
     return sum(h["pnl_usd"] for h in state["history"] if h["closed"] >= start)
 
+async def jget(c, url):
+    """Safe GET that returns parsed JSON or None, and logs why it failed."""
+    host = url.split("/")[2]
+    try:
+        r = await c.get(url, headers={"Accept": "application/json",
+                                      "User-Agent": "Mozilla/5.0 PumpPulse"})
+        if r.status_code != 200:
+            log(f"HTTP {r.status_code} from {host}")
+            return None
+        if not r.text.strip():
+            log(f"EMPTY reply from {host}")
+            return None
+        return r.json()
+    except Exception as e:
+        log(f"FETCH FAIL {host}: {type(e).__name__}")
+        return None
+
 async def best_pair(c, mint):
-    r = await c.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}")
-    pairs = [p for p in (r.json().get("pairs") or []) if p.get("chainId") == "solana"]
+    data = await jget(c, f"https://api.dexscreener.com/latest/dex/tokens/{mint}")
+    if not isinstance(data, dict):
+        return None
+    pairs = [p for p in (data.get("pairs") or []) if p.get("chainId") == "solana"]
     return max(pairs, key=lambda p: (p.get("liquidity") or {}).get("usd", 0), default=None)
 
 async def rug_ok(c, mint):
-    try:
-        r = await c.get(f"https://api.rugcheck.xyz/v1/tokens/{mint}/report/summary")
-        if r.status_code != 200:
-            return False
-        return not any(x.get("level") == "danger" for x in r.json().get("risks") or [])
-    except Exception:
+    data = await jget(c, f"https://api.rugcheck.xyz/v1/tokens/{mint}/report/summary")
+    if not isinstance(data, dict):
         return False
+    return not any(x.get("level") == "danger" for x in data.get("risks") or [])
 
 async def scan(c):
     if state["paused"] or day_pnl() <= -CFG["daily_loss_limit_usd"]:
         return
-    r = await c.get("https://api.dexscreener.com/token-profiles/latest/v1")
-    for prof in r.json():
+    profiles = await jget(c, "https://api.dexscreener.com/token-profiles/latest/v1")
+    if not isinstance(profiles, list):
+        return
+    checked = 0
+    for prof in profiles:
+        if checked >= 15:
+            break
         if prof.get("chainId") != "solana":
             continue
-        mint = prof["tokenAddress"]
-        if mint in state["seen"] or mint in state["positions"]:
+        mint = prof.get("tokenAddress")
+        if not mint or mint in state["seen"] or mint in state["positions"]:
             continue
         if len(state["positions"]) >= CFG["max_open"]:
             return
+        checked += 1
+        await asyncio.sleep(0.4)  # be gentle with rate limits
         pair = await best_pair(c, mint)
         if not pair or not pair.get("pairCreatedAt"):
             continue
@@ -74,7 +100,10 @@ async def scan(c):
         if not await rug_ok(c, mint):
             log(f"REJECT {pair['baseToken']['symbol']} (rugcheck)")
             continue
-        price = float(pair["priceUsd"]) * (1 + CFG["slippage_pct"] / 100)
+        base_price = float(pair.get("priceUsd") or 0)
+        if base_price <= 0:
+            continue
+        price = base_price * (1 + CFG["slippage_pct"] / 100)
         state["positions"][mint] = dict(
             symbol=pair["baseToken"]["symbol"], entry=price,
             qty=CFG["buy_usd"] / price, cost=CFG["buy_usd"],
@@ -92,12 +121,9 @@ def close(mint, exit_price, reason):
 
 async def monitor(c):
     for mint, p in list(state["positions"].items()):
-        try:
-            pair = await best_pair(c, mint)
-            if pair:
-                p["last"] = float(pair["priceUsd"])
-        except Exception:
-            pass
+        pair = await best_pair(c, mint)
+        if pair and pair.get("priceUsd"):
+            p["last"] = float(pair["priceUsd"])
         net = p["qty"] * p["last"] * (1 - CFG["slippage_pct"] / 100)
         p["pnl_pct"] = round((net - p["cost"]) / p["cost"] * 100, 1)
         held = (time.time() - p["opened"]) / 60
@@ -107,18 +133,25 @@ async def monitor(c):
             close(mint, p["last"], "stop-loss")
         elif held >= CFG["max_hold_min"]:
             close(mint, p["last"], "time-stop")
+        await asyncio.sleep(0.3)
 
 async def runner():
-    async with httpx.AsyncClient(timeout=15) as c:
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as c:
         n = 0
         while True:
             try:
                 await monitor(c)
-                if n % 3 == 0:
-                    await scan(c)
-                save()
             except Exception as e:
-                log(f"ERR {e}")
+                log(f"ERR monitor: {type(e).__name__} {e}")
+            if n % 6 == 0:
+                try:
+                    await scan(c)
+                except Exception as e:
+                    log(f"ERR scan: {type(e).__name__} {e}")
+            try:
+                save()
+            except Exception:
+                pass
             n += 1
             await asyncio.sleep(10)
 
