@@ -163,7 +163,8 @@ async def lifespan(app):
     t.cancel()
 
 app = FastAPI(lifespan=lifespan)
-
+from terminal import router as terminal_router
+app.include_router(terminal_router)
 def auth(x_token):
     if x_token != TOKEN:
         raise HTTPException(401)
