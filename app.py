@@ -154,13 +154,15 @@ async def runner():
                 pass
             n += 1
             await asyncio.sleep(10)
-
 @asynccontextmanager
 async def lifespan(app):
     load()
     t = asyncio.create_task(runner())
+    if autopilot:
+        autopilot.start()
     yield
     t.cancel()
+
 
 app = FastAPI(lifespan=lifespan)
 from terminal import router as terminal_router
